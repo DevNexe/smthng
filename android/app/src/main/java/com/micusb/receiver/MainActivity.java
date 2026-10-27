@@ -1,4 +1,4 @@
-package com.micusb;
+package com.micusb.receiver;
 
 import android.app.Activity;
 import android.graphics.Color;
