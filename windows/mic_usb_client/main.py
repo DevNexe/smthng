@@ -3,8 +3,9 @@ import math
 import socket
 import struct
 import sys
+import threading
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
 from PySide6.QtWidgets import (
@@ -12,12 +13,50 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QPushButton, QSpinBox, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
+try:
+    import numpy as np
+    import soundcard as sc
+except Exception:  # без soundcard доступны только микрофоны
+    np = sc = None
+
 MAGIC = 0x4D555331
 SAMPLE_RATE = 48_000
 FRAME_SAMPLES = 480
 FRAME_BYTES = FRAME_SAMPLES * 2
 DEFAULT_HOST = "192.168.42.129"  # адрес телефона при USB-модеме (типично для Android)
 DEFAULT_PORT = 42042
+
+
+class LoopbackCapture(QObject):
+    """Захват системного звука (WASAPI loopback) в отдельном потоке."""
+    pcm = Signal(bytes)
+    error = Signal(str)
+
+    def __init__(self, speaker_id):
+        super().__init__()
+        self.speaker_id = speaker_id
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._run, name="mic-usb-loopback", daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        try:
+            mic = sc.get_microphone(self.speaker_id, include_loopback=True)
+            channels = max(1, min(2, mic.channels))
+            with mic.recorder(samplerate=SAMPLE_RATE, channels=channels, blocksize=FRAME_SAMPLES) as rec:
+                while not self._stop.is_set():
+                    data = rec.record(numframes=FRAME_SAMPLES)
+                    if self._stop.is_set():
+                        break
+                    mono = data.mean(axis=1) if data.ndim > 1 else data
+                    self.pcm.emit((np.clip(mono, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+        except Exception as exc:
+            if not self._stop.is_set():
+                self.error.emit(str(exc))
 
 
 class MicUsbWindow(QMainWindow):
@@ -32,7 +71,8 @@ class MicUsbWindow(QMainWindow):
         self.seq = 0
         self.sent_packets = 0
         self.level = 0
-        self.input_devices = []
+        self.sources = []
+        self.capture = None
         self.setWindowTitle("Mic USB Bridge")
         self.setFixedSize(470, 430)
         self.setWindowIcon(self._make_icon())
@@ -75,7 +115,7 @@ class MicUsbWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setContentsMargins(24, 18, 24, 18)
         layout.addWidget(QLabel("MIC USB BRIDGE", objectName="title"))
-        layout.addWidget(QLabel("ПК → телефон • USB-модем • PCM 48 kHz", objectName="muted"))
+        layout.addWidget(QLabel("ПК → телефон • системный звук / микрофон • PCM 48 kHz", objectName="muted"))
 
         card = QFrame(objectName="card")
         grid = QGridLayout(card)
@@ -88,7 +128,7 @@ class MicUsbWindow(QMainWindow):
         self.port.setRange(1024, 65535)
         self.port.setValue(DEFAULT_PORT)
         grid.addWidget(self.port, 1, 1)
-        grid.addWidget(QLabel("МИКРОФОН ПК", objectName="caption"), 2, 0, 1, 2)
+        grid.addWidget(QLabel("ИСТОЧНИК ЗВУКА", objectName="caption"), 2, 0, 1, 2)
         self.input_combo = QComboBox()
         self.input_combo.setMinimumWidth(280)
         self.refresh_button = QPushButton("Обновить")
@@ -114,22 +154,31 @@ class MicUsbWindow(QMainWindow):
     def refresh_inputs(self):
         if self.running:
             return
-        current_name = self.input_combo.currentText() if self.input_combo.count() else ""
+        current = self.input_combo.currentText() if self.input_combo.count() else ""
         self.input_combo.clear()
-        self.input_devices = list(QMediaDevices.audioInputs())
-        default_id = QMediaDevices.defaultAudioInput().id()
+        self.sources = []
+        if sc is not None:
+            try:
+                default_id = sc.default_speaker().id
+                speakers = sorted(sc.all_speakers(), key=lambda s: s.id != default_id)
+                for spk in speakers:
+                    label = f"Системный звук: {spk.name}" + (" (по умолчанию)" if spk.id == default_id else "")
+                    self.sources.append(("loopback", spk.id, label))
+            except Exception:
+                pass
+        default_mic = QMediaDevices.defaultAudioInput().id()
+        for dev in QMediaDevices.audioInputs():
+            label = f"Микрофон: {dev.description()}" + (" (по умолчанию)" if dev.id() == default_mic else "")
+            self.sources.append(("mic", dev, label))
         selected = 0
-        for index, device in enumerate(self.input_devices):
-            name = device.description()
-            if device.id() == default_id:
-                name += " (по умолчанию)"
-            self.input_combo.addItem(name)
-            if device.description() == current_name or (not current_name and device.id() == default_id):
+        for index, (_kind, _payload, label) in enumerate(self.sources):
+            self.input_combo.addItem(label)
+            if label == current:
                 selected = index
-        if self.input_devices:
+        if self.sources:
             self.input_combo.setCurrentIndex(selected)
         else:
-            self.input_combo.addItem("Микрофоны не найдены")
+            self.input_combo.addItem("Источники звука не найдены")
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(self._make_icon(), self)
@@ -151,8 +200,8 @@ class MicUsbWindow(QMainWindow):
         self.stop() if self.running else self.start()
 
     def start(self):
-        if not self.input_devices:
-            QMessageBox.warning(self, "Нет микрофона", "Подключите микрофон и нажмите «Обновить».")
+        if not self.sources:
+            QMessageBox.warning(self, "Нет источника звука", "Источники не найдены. Нажмите «Обновить».")
             return
         host = self.host.text().strip()
         port = self.port.value()
@@ -169,7 +218,14 @@ class MicUsbWindow(QMainWindow):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.setblocking(False)
-            self._start_audio()
+            kind, payload, _label = self.sources[self.input_combo.currentIndex()]
+            if kind == "loopback":
+                self.capture = LoopbackCapture(payload)
+                self.capture.pcm.connect(self._feed)
+                self.capture.error.connect(self._error)
+                self.capture.start()
+            else:
+                self._start_audio(payload)
         except Exception as exc:
             self.stop()
             QMessageBox.critical(self, "Не удалось открыть микрофон", str(exc))
@@ -184,12 +240,11 @@ class MicUsbWindow(QMainWindow):
         self.status.setStyleSheet("color: #a78bfa")
         self.status.setText(f"● Передача на {host}:{port}")
 
-    def _start_audio(self):
+    def _start_audio(self, device):
         audio_format = QAudioFormat()
         audio_format.setSampleRate(SAMPLE_RATE)
         audio_format.setChannelCount(1)
         audio_format.setSampleFormat(QAudioFormat.Int16)
-        device = self.input_devices[self.input_combo.currentIndex()]
         self.audio_source = QAudioSource(device, audio_format, self)
         self.audio_source.setBufferSize(FRAME_BYTES * 4)
         self.audio_io = self.audio_source.start()
@@ -198,9 +253,14 @@ class MicUsbWindow(QMainWindow):
         self.audio_io.readyRead.connect(self._on_ready)
 
     def _on_ready(self):
-        if not self.sock or not self.audio_io:
+        if not self.audio_io:
             return
-        self.buffer += bytes(self.audio_io.readAll())
+        self._feed(bytes(self.audio_io.readAll()))
+
+    def _feed(self, data):
+        if not self.sock:
+            return
+        self.buffer += data
         while len(self.buffer) >= FRAME_BYTES:
             frame = bytes(self.buffer[:FRAME_BYTES])
             del self.buffer[:FRAME_BYTES]
@@ -233,6 +293,14 @@ class MicUsbWindow(QMainWindow):
         self.toggle_button.style().polish(self.toggle_button)
 
     def stop(self):
+        if self.capture is not None:
+            self.capture.stop()
+            for signal, slot in ((self.capture.pcm, self._feed), (self.capture.error, self._error)):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+            self.capture = None
         if self.audio_io is not None:
             try:
                 self.audio_io.readyRead.disconnect(self._on_ready)
