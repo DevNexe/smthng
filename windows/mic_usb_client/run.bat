@@ -1,0 +1,1 @@
+py C:\Users\DevNexe\Documents\AudioRelay\mic-usb-client-source\windows\mic_usb_client\main.py
